@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: clermes
+version: 1.0.0
+description: "Dispatch tasks to a fleet of long-lived Claude Code workers running in tmux. Each worker pinned to one workdir, holds warm project context across sessions. Coordination is file-based under ~/.clermes/. Built for offloading heavy work from the orchestrator to dedicated Claude Code instances."
+author: Canopy Road Workshop
+license: AGPL-3.0-or-later
+kind: standalone
+platforms:
+  - linux
+provides_tools:
+  - clermes_list
+  - clermes_snapshot
+  - clermes_send
+  - clermes_capture
+  - clermes_spawn
+  - clermes_heal
+  - clermes_pick_worker
+  - clermes_dispatch_parallel
+  - clermes_drain_events
+  - clermes_history
+hooks:
+  - on_session_start
+requires_env:
+  - tmux
+  - jq
+  - claude

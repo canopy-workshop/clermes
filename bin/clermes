@@ -1,0 +1,557 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# clermes: bash dispatcher for the Claude worker fleet
+#
+# Subcommands:
+#   list                       show fleet status (alive, healthy, locked)
+#   spawn <worker>             start a worker in tmux
+#   spawn-all                  start every worker in the registry
+#   send <worker> "<prompt>"   send a task to a worker (auto-resumes if Claude exited)
+#   capture <worker> [lines]   show recent output from a worker
+#   health <worker>            report worker pane state (claude|bash|dead|other:<proc>)
+#   snapshot                   JSON inventory of workers + recent pane state
+#   attach <worker>            attach to a worker's tmux session
+#   kill <worker>              terminate a worker's tmux session (session file survives)
+#   heal                       respawn dead workers; resume Claude inside live-but-bash panes
+#   watch                      tail done/disputes/announcing dirs (needs inotifywait)
+#   apply-bell-hooks [<worker>|all]    retrofit tmux monitor-bell + alert-bell on live sessions
+#   apply-hooks [<worker>|all]         alias for apply-bell-hooks
+#   install-claude-hooks [<worker>|all|--user]
+#                              register bell-on-input-needed.sh in Claude Code settings.json
+#
+# Design notes (pitfall-driven, see docs/protocol.md):
+# * Pane state is read from `tmux list-panes -F '#{pane_current_command}'`.
+#   The Claude binary shows up as its version string (e.g. "2.1.146"). Never
+#   detect via visual glyphs in capture-pane output.
+# * After tmux new-session, the shell inside the pane needs ~1s before it is
+#   ready for send-keys. Keys sent earlier vanish.
+# * The Claude binary is invoked by its readlink-resolved path. The
+#   ~/.local/bin/claude symlink fires a launcher that exits before the TUI
+#   comes up when send-keys'd into a fresh pane.
+# * Multi-line prompts go through load-buffer + paste-buffer, not send-keys
+#   with literal newlines.
+# * tmux pipe-pane is never used on a worker session. Log via periodic
+#   capture-pane writes to a file.
+# * Workdir-to-projects-dir encoding replaces every non-alphanumeric char
+#   (including '.' and '/') with '-'.
+# * Assigned/<worker> writes go through an atomic mv from a tmp file.
+# * monitor-bell + alert-bell are applied on every spawn and every send;
+#   session-scoped hooks vanish on tmux server restart.
+# * After every send, capture-pane runs 2s later and looks for the
+#   "Conversation compacted" sentinel; if present, the brief is resent.
+
+set -euo pipefail
+
+# ─────────────────────── env + paths ───────────────────────
+
+CLERMES_HOME="${CLERMES_HOME:-$HOME/.clermes}"
+REGISTRY="$CLERMES_HOME/registry/fleet.json"
+WORKERS_DIR="$CLERMES_HOME/workers"
+LOGS_DIR="$CLERMES_HOME/logs"
+
+SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+ON_BELL_SCRIPT="${ON_BELL_SCRIPT:-$SCRIPT_DIR/../scripts/clermes-on-bell.sh}"
+BELL_INPUT_HOOK_SCRIPT="${BELL_INPUT_HOOK_SCRIPT:-$SCRIPT_DIR/../scripts/bell-on-input-needed.sh}"
+TEMPLATE_DIR="${CLERMES_TEMPLATE_DIR:-$SCRIPT_DIR/../templates}"
+DEFAULT_PREAMBLE="$TEMPLATE_DIR/preamble.md"
+
+CLERMES_IDLE_PANE_LINES=40
+if [[ -f "$CLERMES_HOME/idle.env" ]]; then
+  # shellcheck disable=SC1091
+  set -a; . "$CLERMES_HOME/idle.env"; set +a
+fi
+
+# ─────────────────────── error + dep helpers ───────────────────────
+
+die() { echo "clermes: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+if ! command -v uuidgen >/dev/null 2>&1; then
+  uuidgen() { cat /proc/sys/kernel/random/uuid; }
+fi
+
+# ─────────────────────── registry helpers ───────────────────────
+
+worker_get() { jq -er ".workers[\"$1\"]$2" "$REGISTRY" 2>/dev/null || die "worker '$1' not found in registry"; }
+worker_session() { worker_get "$1" '.tmux_session'; }
+worker_workdir() { worker_get "$1" '.workdir'; }
+worker_names() { jq -r '.workers | keys[]' "$REGISTRY"; }
+
+worker_session_id() {
+  local name="$1"
+  local sid_file="$WORKERS_DIR/$name/session-id"
+  if [[ -f "$sid_file" ]]; then
+    cat "$sid_file"
+  else
+    jq -r ".workers[\"$name\"].session_id // empty" "$REGISTRY"
+  fi
+}
+
+ensure_session_id() {
+  local name="$1"
+  local sid; sid="$(worker_session_id "$name" || true)"
+  if [[ -z "$sid" ]]; then
+    sid="$(uuidgen)"
+    mkdir -p "$WORKERS_DIR/$name"
+    echo "$sid" > "$WORKERS_DIR/$name/session-id"
+    local tmp; tmp="$(mktemp)"
+    jq ".workers[\"$name\"].session_id = \"$sid\"" "$REGISTRY" > "$tmp" && mv "$tmp" "$REGISTRY"
+  fi
+  echo "$sid"
+}
+
+# Read a scalar field from the `instance:` block of config.yaml. Tolerates a
+# missing file and parse failures. Returns empty on miss. Used only for
+# preamble substitution where defaults are acceptable.
+_read_instance_field() {
+  local field="$1"
+  local cfg="$CLERMES_HOME/config.yaml"
+  [[ -f "$cfg" ]] || return 0
+  { awk '
+      /^instance:/ { in_block=1; next }
+      in_block && /^[^[:space:]]/ { in_block=0 }
+      in_block { print }
+    ' "$cfg" 2>/dev/null \
+    | grep -E "^[[:space:]]+${field}:" \
+    | head -1 \
+    | sed -E "s/^[[:space:]]+${field}:[[:space:]]*//; s/[[:space:]]*$//"
+  } || true
+}
+
+# ─────────────────────── pane state probes ───────────────────────
+
+# Returns: dead | bash | claude | other:<procname>
+pane_state() {
+  local session="$1"
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    echo "dead"; return
+  fi
+  local proc
+  proc="$({ tmux list-panes -t "$session" -F '#{pane_current_command}' 2>/dev/null | head -1; } || true)"
+  case "$proc" in
+    "$CLAUDE_PROC") echo "claude" ;;
+    bash|sh|zsh|fish) echo "bash" ;;
+    "") echo "dead" ;;
+    *) echo "other:$proc" ;;
+  esac
+}
+
+wait_for_state() {
+  local session="$1" want="$2" timeout="${3:-25}"
+  local i
+  for ((i=0; i<timeout; i++)); do
+    sleep 1
+    if [[ "$(pane_state "$session")" == "$want" ]]; then return 0; fi
+  done
+  return 1
+}
+
+# ─────────────────────── pane I/O ───────────────────────
+
+log_snapshot() {
+  local name="$1" session
+  session="$(worker_session "$name")"
+  local logf="$LOGS_DIR/claude-$name.log"
+  tmux has-session -t "$session" 2>/dev/null || return 0
+  {
+    printf '\n===== %s =====\n' "$(date -Iseconds)"
+    tmux capture-pane -t "$session" -p -S -200
+  } >> "$logf"
+}
+
+paste_into_pane() {
+  local session="$1" text="$2"
+  local buf; buf="$(mktemp)"
+  printf '%s\n' "$text" > "$buf"
+  tmux load-buffer -t "$session" "$buf"
+  tmux paste-buffer -t "$session"
+  rm -f "$buf"
+  sleep 0.5
+  tmux send-keys -t "$session" Enter
+}
+
+# Render preamble: per-worker override at workers/<name>/preamble.md wins,
+# else templates/preamble.md. Variables substituted: WORKER, WORKDIR,
+# INSTANCE_NAME, PRINCIPAL.
+render_preamble() {
+  local name="$1" workdir="$2"
+  local override="$WORKERS_DIR/$name/preamble.md"
+  local src
+  if [[ -f "$override" ]]; then
+    src="$override"
+  elif [[ -f "$DEFAULT_PREAMBLE" ]]; then
+    src="$DEFAULT_PREAMBLE"
+  else
+    die "preamble template not found at $DEFAULT_PREAMBLE"
+  fi
+  local instance principal content
+  instance="$(_read_instance_field name)"
+  instance="${instance:-clermes}"
+  principal="$(_read_instance_field principal)"
+  principal="${principal:-operator}"
+  content="$(cat "$src")"
+  content="${content//\$\{WORKER\}/$name}"
+  content="${content//\$\{WORKDIR\}/$workdir}"
+  content="${content//\$\{INSTANCE_NAME\}/$instance}"
+  content="${content//\$\{PRINCIPAL\}/$principal}"
+  printf '%s\n' "$content"
+}
+
+# Extract TASK_ID: <id> from a task prompt. Returns the id or empty.
+# Wrapped in { ...; } || true because grep returns 1 on no match.
+_extract_task_id() {
+  local prompt="$1"
+  { printf '%s' "$prompt" | grep -oE 'TASK_ID:[[:space:]]*[A-Za-z0-9_.-]+' \
+    | head -1 | sed -E 's/^TASK_ID:[[:space:]]*//'; } || true
+}
+
+_assign_task() {
+  local name="$1" prompt="$2"
+  local task_id; task_id="$(_extract_task_id "$prompt")"
+  if [[ -z "$task_id" ]]; then
+    task_id="unknown-$(date +%s)"
+    echo "$name: warning: no TASK_ID in prompt; assigning marker $task_id" >&2
+  fi
+  local tmpf="$CLERMES_HOME/assigned/.${name}.tmp.$$"
+  printf '%s\n' "$task_id" > "$tmpf"
+  mv -f "$tmpf" "$CLERMES_HOME/assigned/$name"
+  rm -f "$CLERMES_HOME/state/last-notify-$name"
+}
+
+# ─────────────────────── bell hooks ───────────────────────
+
+_apply_bell_hooks() {
+  local session="$1"
+  tmux has-session -t "$session" 2>/dev/null || return 0
+  tmux set-window-option -t "$session" monitor-bell on >/dev/null 2>&1 || true
+  tmux set-hook -t "$session" alert-bell \
+    "run-shell -b '$ON_BELL_SCRIPT #{session_name}'" >/dev/null 2>&1 || true
+}
+
+# Pre-compact swallow check (pitfall: pre-compact can silently drop an
+# in-flight dispatch). After send, capture 2s later and look for the
+# sentinel; resend if found. Skip with CLERMES_SKIP_POST_COMPACT=1 in
+# automation that does not care.
+_check_post_compact() {
+  [[ "${CLERMES_SKIP_POST_COMPACT:-0}" == "1" ]] && return 0
+  local name="$1" session="$2" prompt="$3"
+  sleep 2
+  local cap; cap="$({ tmux capture-pane -t "$session" -p -S -10 2>/dev/null; } || true)"
+  if printf '%s' "$cap" | grep -q 'Conversation compacted'; then
+    echo "$name: detected post-compact idle, resending" >&2
+    paste_into_pane "$session" "$prompt"
+    log_snapshot "$name"
+  fi
+}
+
+# ─────────────────────── subcommands ───────────────────────
+
+cmd_list() {
+  printf "%-12s %-22s %-7s %-8s %-7s %s\n" "WORKER" "TMUX SESSION" "ALIVE" "STATE" "LOCKED" "WORKDIR"
+  for name in $(worker_names); do
+    local session workdir alive state locked
+    session="$(worker_session "$name")"
+    workdir="$(worker_workdir "$name")"
+    state="$(pane_state "$session")"
+    if [[ "$state" == "dead" ]]; then alive="no"; else alive="yes"; fi
+    if [[ -f "$CLERMES_HOME/locks/claude-$name.lock" ]]; then locked="yes"; else locked="no"; fi
+    printf "%-12s %-22s %-7s %-8s %-7s %s\n" "$name" "$session" "$alive" "$state" "$locked" "$workdir"
+  done
+}
+
+cmd_health() {
+  local name="$1"
+  local session; session="$(worker_session "$name")"
+  pane_state "$session"
+}
+
+cmd_snapshot() {
+  local out='{"timestamp":"'"$(date -Iseconds)"'","workers":{'
+  local first=1
+  for name in $(worker_names); do
+    [[ $first -eq 1 ]] || out+=","
+    first=0
+    local session; session="$(worker_session "$name")"
+    local state; state="$(pane_state "$session")"
+    local capture=""
+    if [[ "$state" != "dead" ]]; then
+      capture="$({ tmux capture-pane -t "$session" -p -S -20 2>/dev/null | tail -20; } || true)"
+    fi
+    local lock=""
+    [[ -f "$CLERMES_HOME/locks/claude-$name.lock" ]] && lock="$(cat "$CLERMES_HOME/locks/claude-$name.lock")"
+    out+="\"$name\":$(jq -nc --arg state "$state" --arg cap "$capture" --arg lock "$lock" \
+      '{state:$state, recent:$cap, lock:$lock}')"
+  done
+  out+='}}'
+  echo "$out" | jq .
+}
+
+cmd_spawn() {
+  local name="$1"
+  local session workdir sid
+  session="$(worker_session "$name")"
+  workdir="$(worker_workdir "$name")"
+  [[ -d "$workdir" ]] || die "workdir does not exist: $workdir"
+
+  local state; state="$(pane_state "$session")"
+  if [[ "$state" == "claude" ]]; then
+    echo "$name: already running"; return 0
+  fi
+  if [[ "$state" == "bash" || "$state" == "other:"* ]]; then
+    echo "$name: tmux session exists but front process is '$state', healing instead"
+    _heal_pane "$name"
+    return
+  fi
+
+  sid="$(ensure_session_id "$name")"
+  # Claude Code encodes the workdir into the projects-dir name by replacing
+  # every non-alphanumeric character (including '.' and '/') with '-'. Match
+  # that exactly, or we miss existing session files and wrongly start fresh.
+  local enc; enc="$(echo "$workdir" | sed 's|[^a-zA-Z0-9]|-|g')"
+  local sid_file="$HOME/.claude/projects/$enc/$sid.jsonl"
+  local fresh=1
+  [[ -f "$sid_file" ]] && fresh=0
+
+  local width="${CLERMES_TMUX_WIDTH:-200}"
+  local height="${CLERMES_TMUX_HEIGHT:-50}"
+  tmux new-session -d -s "$session" -x "$width" -y "$height" -c "$workdir"
+  # Let the shell inside the pane finish coming up before send-keys.
+  sleep 1
+
+  if [[ $fresh -eq 0 ]]; then
+    tmux send-keys -t "$session" "$CLAUDE_BIN -r $sid" Enter
+  else
+    tmux send-keys -t "$session" "$CLAUDE_BIN --session-id $sid" Enter
+  fi
+
+  if ! wait_for_state "$session" "claude" 25; then
+    echo "$name: WARNING: Claude did not come up. Pane state: $(pane_state "$session")" >&2
+    tmux capture-pane -t "$session" -p -S -20 >&2
+    return 1
+  fi
+
+  # Workspace trust dialog appears once per workdir, default is "Yes". Enter accepts.
+  if tmux capture-pane -t "$session" -p -S -20 | grep -qi 'trust this folder'; then
+    tmux send-keys -t "$session" Enter
+    sleep 2
+  fi
+
+  if [[ $fresh -eq 1 ]]; then
+    paste_into_pane "$session" "$(render_preamble "$name" "$workdir")"
+  fi
+
+  _apply_bell_hooks "$session"
+  log_snapshot "$name"
+  echo "$name: spawned ($session, session-id=$sid)"
+}
+
+cmd_spawn_all() {
+  for name in $(worker_names); do cmd_spawn "$name" || true; done
+}
+
+_heal_pane() {
+  local name="$1"
+  local session sid
+  session="$(worker_session "$name")"
+  sid="$(worker_session_id "$name")"
+  if [[ -z "$sid" ]]; then
+    echo "$name: no session-id on file. Killing pane and respawning fresh."
+    tmux kill-session -t "$session" 2>/dev/null || true
+    cmd_spawn "$name"
+    return
+  fi
+  echo "$name: resuming Claude with session-id $sid"
+  tmux send-keys -t "$session" "$CLAUDE_BIN -r $sid" Enter
+  if ! wait_for_state "$session" "claude" 25; then
+    echo "$name: WARNING: resume failed. Pane state: $(pane_state "$session")" >&2
+    tmux capture-pane -t "$session" -p -S -20 >&2
+    return 1
+  fi
+  echo "$name: resumed"
+}
+
+cmd_send() {
+  local name="$1" prompt="$2"
+  local session; session="$(worker_session "$name")"
+  local state; state="$(pane_state "$session")"
+  case "$state" in
+    dead)
+      echo "$name: not running. Spawning first."
+      cmd_spawn "$name" || die "spawn failed"
+      ;;
+    bash|other:*)
+      echo "$name: front process is '$state', healing before send."
+      _heal_pane "$name" || die "heal failed"
+      ;;
+    claude) ;;
+    *) die "unknown pane state: $state" ;;
+  esac
+  _apply_bell_hooks "$session"
+  _assign_task "$name" "$prompt"
+  paste_into_pane "$session" "$prompt"
+  log_snapshot "$name"
+  _check_post_compact "$name" "$session" "$prompt"
+  echo "$name: sent ($(printf '%s' "$prompt" | wc -c) chars)"
+}
+
+cmd_capture() {
+  local name="$1" lines="${2:-80}"
+  local session; session="$(worker_session "$name")"
+  tmux capture-pane -t "$session" -p -S "-$lines"
+}
+
+cmd_attach() {
+  local name="$1"
+  local session; session="$(worker_session "$name")"
+  tmux attach-session -t "$session"
+}
+
+cmd_kill() {
+  local name="$1"
+  local session; session="$(worker_session "$name")"
+  tmux has-session -t "$session" 2>/dev/null && tmux kill-session -t "$session"
+  echo "$name: killed (session file preserved for resume)"
+}
+
+cmd_heal() {
+  for name in $(worker_names); do
+    local session state
+    session="$(worker_session "$name")"
+    state="$(pane_state "$session")"
+    case "$state" in
+      claude) ;;
+      dead) echo "$name: dead, respawning"; cmd_spawn "$name" || true ;;
+      bash|other:*) echo "$name: pane is '$state', healing"; _heal_pane "$name" || true ;;
+    esac
+  done
+}
+
+cmd_watch() {
+  echo "Watching ~/.clermes/{done,disputes,announcing}/  (Ctrl-C to stop)"
+  command -v inotifywait >/dev/null 2>&1 || die "inotifywait required (apt install inotify-tools)"
+  inotifywait -m -r -e create -e moved_to \
+    "$CLERMES_HOME/done" "$CLERMES_HOME/disputes" "$CLERMES_HOME/announcing" \
+    --format '%T %w%f' --timefmt '%H:%M:%S'
+}
+
+cmd_apply_bell_hooks() {
+  local target="${1:-all}"
+  if [[ "$target" == "all" ]]; then
+    for name in $(worker_names); do
+      local session; session="$(worker_session "$name")"
+      if tmux has-session -t "$session" 2>/dev/null; then
+        _apply_bell_hooks "$session"
+        echo "$name: bell hooks applied (monitor-bell on, alert-bell -> $ON_BELL_SCRIPT)"
+      else
+        echo "$name: skipped (no live session)"
+      fi
+    done
+  else
+    local session; session="$(worker_session "$target")"
+    tmux has-session -t "$session" 2>/dev/null || die "$target: no live session"
+    _apply_bell_hooks "$session"
+    echo "$target: bell hooks applied (monitor-bell on, alert-bell -> $ON_BELL_SCRIPT)"
+  fi
+}
+
+cmd_install_claude_hooks() {
+  local target="${1:-all}"
+  local bell_cmd; bell_cmd="bash \"$BELL_INPUT_HOOK_SCRIPT\""
+
+  _install_into_settings() {
+    local settings_file="$1" label="$2"
+    mkdir -p "$(dirname "$settings_file")"
+    if [[ ! -f "$settings_file" ]]; then
+      echo '{}' > "$settings_file"
+    fi
+    if jq -e --arg cmd "$bell_cmd" '
+      [(.hooks.Notification // [])[].hooks[]?.command,
+       (.hooks.Stop // [])[].hooks[]?.command]
+      | any(. == $cmd)
+    ' "$settings_file" >/dev/null 2>&1; then
+      echo "$label: bell hook already registered, skipping"
+      return 0
+    fi
+    local tmp; tmp="$(mktemp)"
+    jq --arg cmd "$bell_cmd" '
+      .hooks //= {}
+      | .hooks.Notification //= []
+      | .hooks.Stop //= []
+      | .hooks.Notification += [{
+          "hooks": [{"type": "command", "command": $cmd, "timeout": 5}]
+        }]
+      | .hooks.Stop += [{
+          "hooks": [{"type": "command", "command": $cmd, "timeout": 5}]
+        }]
+    ' "$settings_file" > "$tmp" \
+      && mv -f "$tmp" "$settings_file" \
+      && echo "$label: bell hook registered in $settings_file"
+  }
+
+  case "$target" in
+    --user)
+      _install_into_settings "$HOME/.claude/settings.json" "user-level"
+      ;;
+    all)
+      for name in $(worker_names); do
+        local wd; wd="$(worker_workdir "$name")"
+        _install_into_settings "$wd/.claude/settings.json" "$name"
+      done
+      ;;
+    *)
+      local wd; wd="$(worker_workdir "$target")"
+      _install_into_settings "$wd/.claude/settings.json" "$target"
+      ;;
+  esac
+  echo ""
+  echo "Note: existing Claude sessions must be restarted (or /resume) to pick"
+  echo "      up new hook config. clermes heal will do this for each worker."
+}
+
+usage() {
+  sed -n '4,21p' "$0"
+  exit 1
+}
+
+# ─────────────────────── lib-mode short-circuit ───────────────────────
+# When sourced for testing, skip preflight + main dispatch. Functions above
+# are now defined and callable. Tests pre-stub tmux/jq/claude on PATH and set
+# CLAUDE_PROC + CLAUDE_BIN.
+if [[ "${CLERMES_LIB_MODE:-0}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+# ─────────────────────── preflight ───────────────────────
+
+need tmux
+need jq
+need claude
+
+CLAUDE_BIN="$(readlink -f "$(command -v claude)")"
+[[ -x "$CLAUDE_BIN" ]] || die "claude binary not executable: $CLAUDE_BIN"
+CLAUDE_PROC="$(basename "$CLAUDE_BIN")"
+
+mkdir -p "$WORKERS_DIR" "$LOGS_DIR" \
+  "$CLERMES_HOME"/{done,disputes,announcing,halt,locks,assigned,idle-queue,state,registry}
+
+# ─────────────────────── main dispatch ───────────────────────
+
+[[ $# -ge 1 ]] || usage
+sub="$1"; shift
+case "$sub" in
+  list)                 cmd_list "$@" ;;
+  health)               cmd_health "$@" ;;
+  snapshot)             cmd_snapshot "$@" ;;
+  spawn)                cmd_spawn "$@" ;;
+  spawn-all)            cmd_spawn_all "$@" ;;
+  send)                 [[ $# -ge 2 ]] || die "usage: clermes send <worker> \"<prompt>\""; cmd_send "$@" ;;
+  capture)              cmd_capture "$@" ;;
+  attach)               cmd_attach "$@" ;;
+  kill)                 cmd_kill "$@" ;;
+  heal)                 cmd_heal "$@" ;;
+  watch)                cmd_watch "$@" ;;
+  apply-bell-hooks)     cmd_apply_bell_hooks "$@" ;;
+  apply-hooks)          cmd_apply_bell_hooks "$@" ;;
+  install-claude-hooks) cmd_install_claude_hooks "$@" ;;
+  *) usage ;;
+esac

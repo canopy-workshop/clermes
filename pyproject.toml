@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clermes"
+version = "1.0.0"
+description = "File-based orchestration for a fleet of long-lived Claude Code workers."
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "Brad Harris", email = "brad@canopyworkshop.com" }]
+requires-python = ">=3.11"
+dependencies = [
+  "pyyaml>=6.0",
+  "jsonschema>=4.0",
+]
+
+[project.urls]
+Source = "https://github.com/canopy-workshop/clermes"
+
+[tool.setuptools.packages.find]
+include = ["clermes*"]

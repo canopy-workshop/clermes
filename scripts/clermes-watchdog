@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""clermes-watchdog: cron job for the worker fleet.
+
+Responsibilities, run in order:
+
+1. Sweep `assigned/<worker>` markers whose task has a matching done/ or
+   disputes/ file. Clears the stale assignment and dedupe state.
+2. Drain `idle-queue/*.json` (notifications written by the tmux alert-bell
+   hook). One emission per queue entry, then delete the file.
+3. Emit new files in done/disputes/announcing since the previous run.
+4. Append every observation to `events.jsonl` via clermes.history.
+
+Silent stdout when nothing happened. Designed for once-a-minute cron.
+
+The watchdog cursor lives at `~/.clermes/.watchdog-state` and is separate
+from the Hermes plugin's cursor (`state/.plugin-cursor`). Cron and plugin
+both consume the same file channels without fighting.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List
+
+from clermes.config import clermes_home
+from clermes import history
+
+
+def state_path() -> Path:
+    return clermes_home() / ".watchdog-state"
+
+
+def read_last_run() -> float:
+    p = state_path()
+    if not p.exists():
+        return time.time()
+    try:
+        return float(p.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        return time.time()
+
+
+def write_last_run(ts: float) -> None:
+    state_path().write_text(f"{ts:.6f}\n", encoding="utf-8")
+
+
+def ensure_dirs() -> None:
+    home = clermes_home()
+    for sub in ("idle-queue", "assigned", "state", "logs",
+                "done", "disputes", "announcing"):
+        (home / sub).mkdir(parents=True, exist_ok=True)
+
+
+def sweep_assigned_markers() -> List[dict]:
+    """Remove assigned/<worker> markers whose task has a done or dispute
+    file. Return cleanup records for the history log."""
+    cleared: List[dict] = []
+    home = clermes_home()
+    assigned_dir = home / "assigned"
+    if not assigned_dir.exists():
+        return cleared
+    for marker in assigned_dir.iterdir():
+        if not marker.is_file() or marker.name.startswith("."):
+            continue
+        worker = marker.name
+        try:
+            task_id = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not task_id:
+            marker.unlink(missing_ok=True)
+            cleared.append({"event": "assigned-cleanup",
+                            "worker": worker,
+                            "reason": "empty-marker"})
+            continue
+        done_file = home / "done" / f"{task_id}.json"
+        dispute_file = home / "disputes" / f"{task_id}.md"
+        if done_file.exists() or dispute_file.exists():
+            marker.unlink(missing_ok=True)
+            (home / "state" / f"last-notify-{worker}").unlink(missing_ok=True)
+            cleared.append({"event": "assigned-cleanup",
+                            "worker": worker,
+                            "task_id": task_id,
+                            "reason": "done-or-dispute"})
+    return cleared
+
+
+def drain_idle_queue() -> List[dict]:
+    """Pop every idle-queue/*.json. Return parsed payloads in file-mtime order."""
+    drained: List[dict] = []
+    qdir = clermes_home() / "idle-queue"
+    if not qdir.exists():
+        return drained
+    queue_files = [p for p in qdir.iterdir()
+                   if p.is_file() and p.name.endswith(".json")]
+    queue_files.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+    for qf in queue_files:
+        try:
+            data = json.loads(qf.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            qf.unlink(missing_ok=True)
+            continue
+        drained.append(data)
+        qf.unlink(missing_ok=True)
+    return drained
+
+
+def format_idle_block(drained: List[dict]) -> str:
+    if not drained:
+        return ""
+    out = [f"Clermes idle workers ({len(drained)}):", ""]
+    for d in drained:
+        worker = d.get("worker", "?")
+        detected = d.get("detected_at", "?")
+        task_id = d.get("task_id", "?")
+        capture_lines = d.get("capture_lines", "?")
+        pane = d.get("pane_tail", "")
+        out.append(f"── {worker} idle since {detected} ──")
+        out.append(f"  Task: {task_id}")
+        out.append(f"  Pane (last {capture_lines} lines):")
+        for line in pane.splitlines():
+            out.append(f"    {line}")
+        out.append("")
+    return "\n".join(out)
+
+
+def find_new_files(last_run: float) -> List[Path]:
+    home = clermes_home()
+    paths: List[Path] = []
+    for sub, ext in (("done", ".json"), ("disputes", ".md"),
+                     ("announcing", ".txt")):
+        d = home / sub
+        if not d.exists():
+            continue
+        for p in d.iterdir():
+            if not p.is_file() or not p.name.endswith(ext):
+                continue
+            try:
+                if p.stat().st_mtime > last_run:
+                    paths.append(p)
+            except OSError:
+                continue
+    paths.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+    return paths
+
+
+def format_new_files(files: List[Path], last_run: float) -> str:
+    if not files:
+        return ""
+    since = datetime.fromtimestamp(last_run, tz=timezone.utc) \
+        .astimezone().strftime("%H:%M:%S")
+    out = [f"Clermes worker check-in: {len(files)} new file(s) since {since}", ""]
+    for p in files:
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        out.append(f"── [{p.parent.name}] {p.name} ({size}b) ──")
+        try:
+            data = p.read_bytes()
+        except OSError:
+            data = b""
+        if size > 4096:
+            out.append(data[:4096].decode("utf-8", errors="replace"))
+            out.append("")
+            out.append(f"[...truncated, {size}b total; full file at {p}]")
+        else:
+            out.append(data.decode("utf-8", errors="replace"))
+        out.append("")
+    return "\n".join(out)
+
+
+def main(argv: List[str]) -> int:
+    ensure_dirs()
+    last_run = read_last_run()
+    now = time.time()
+
+    cleared = sweep_assigned_markers()
+    drained = drain_idle_queue()
+    new_files = find_new_files(last_run)
+
+    for rec in cleared:
+        history.append(rec)
+    for d in drained:
+        history.append({"event": "idle", **d})
+    for p in new_files:
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = now
+        history.append({
+            "event": "file",
+            "dir": p.parent.name,
+            "name": p.name,
+            "path": str(p),
+            "mtime": mtime,
+        })
+
+    write_last_run(now)
+
+    idle_text = format_idle_block(drained)
+    files_text = format_new_files(new_files, last_run)
+
+    if not idle_text and not files_text:
+        return 0
+
+    if idle_text:
+        sys.stdout.write(idle_text + "\n")
+    if files_text:
+        if idle_text:
+            sys.stdout.write("\n")
+        sys.stdout.write(files_text + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

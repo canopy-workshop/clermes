@@ -1,0 +1,24 @@
+{
+  "_comment": "Claude Code Honcho plugin config. Copy to ~/.honcho/config.json. peerName is the user; aiPeer is each worker's identity. globalOverride makes the flat workspace/peerName win for all hosts (the plugin only knows three host keys by default). The sessions map pins one Honcho session per workdir so per-project memory accumulates without bleeding across projects.",
+  "peerName": "YOUR_USER_PEER",
+  "workspace": "default",
+  "globalOverride": true,
+  "endpoint": {
+    "baseUrl": "http://127.0.0.1:8001/v3"
+  },
+  "sessions": {
+    "/path/to/project/a": "YOUR_USER_PEER-project-a",
+    "/path/to/project/b": "YOUR_USER_PEER-project-b"
+  },
+  "hosts": {
+    "claude_code": {
+      "aiPeer": "claude",
+      "enabled": true,
+      "logging": false,
+      "saveMessages": true,
+      "endpoint": {
+        "baseUrl": "http://127.0.0.1:8001/v3"
+      }
+    }
+  }
+}

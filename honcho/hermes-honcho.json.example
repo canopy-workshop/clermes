@@ -1,0 +1,26 @@
+{
+  "_comment": "Hermes Honcho plugin config. Copy to ~/.hermes/honcho.json. peerName MUST match the value in ~/.honcho/config.json so Hermes and the Claude Code workers build one shared user representation. aiPeer is the Hermes-side identity and may differ from the workers' aiPeer.",
+  "enabled": true,
+  "baseUrl": "http://127.0.0.1:8001",
+  "workspace": "default",
+  "peerName": "YOUR_USER_PEER",
+  "aiPeer": "YOUR_INSTANCE_NAME",
+  "recallMode": "hybrid",
+  "sessionStrategy": "global",
+  "writeFrequency": "async",
+  "saveMessages": true,
+  "observationMode": "directional",
+  "contextCadence": 2,
+  "dialecticCadence": 10,
+  "dialecticDepth": 2,
+  "dialecticReasoningLevel": "low",
+  "contextTokens": 1500,
+  "hosts": {
+    "hermes": {
+      "enabled": true,
+      "aiPeer": "YOUR_INSTANCE_NAME",
+      "recallMode": "hybrid",
+      "sessionStrategy": "global"
+    }
+  }
+}

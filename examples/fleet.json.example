@@ -1,0 +1,23 @@
+{
+  "_comment": "Worker fleet definition. Replace example workers with real ones. session_id is populated by the dispatcher on first spawn -- leave as null in this template. tmux_session should follow the pattern claude-<name>.",
+  "workers": {
+    "example_a": {
+      "workdir": "/path/to/repo/a",
+      "owns": "Short description of this worker's domain",
+      "tmux_session": "claude-example_a",
+      "session_id": null
+    },
+    "example_b": {
+      "workdir": "/path/to/repo/b",
+      "owns": "Short description of this worker's domain",
+      "tmux_session": "claude-example_b",
+      "session_id": null
+    },
+    "scratch": {
+      "workdir": "/path/to/scratch/dir",
+      "owns": "Unpinned one-offs that don't have a home yet",
+      "tmux_session": "claude-scratch",
+      "session_id": null
+    }
+  }
+}

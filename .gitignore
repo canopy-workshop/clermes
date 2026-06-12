@@ -1,0 +1,41 @@
+# Runtime state. Live deployments populate these under ~/.clermes/. They do not
+# belong in this repo even if a deployer accidentally copies them in.
+assigned/
+announcing/
+disputes/
+done/
+halt/
+idle-queue/
+locks/
+logs/
+state/
+workers/
+.watchdog-state
+**/session-id
+
+# Local-only config that should never ship. Use the .example variants in config/.
+config.yaml
+fleet.json
+idle.env
+
+# Python bytecode + venv cruft.
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Honcho live env (operator-edited; the example ships).
+honcho/.env
+
+# Editor + OS cruft.
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

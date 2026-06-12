@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Multi-stage build: stage 1 clones plastic-labs/honcho at a pinned ref;
+# stage 2 builds the runtime image from that source.
+#
+# HONCHO_REF may be a branch, tag, or commit SHA.
+# For a commit SHA, the shallow-clone path falls back to a full clone + checkout.
+
+ARG HONCHO_REF=v3.0.7
+
+# ---------------------------------------------------------------------------
+# Stage 1: clone Honcho source at the pinned ref.
+# ---------------------------------------------------------------------------
+FROM alpine/git:latest AS source
+ARG HONCHO_REF
+RUN git clone --depth 1 --branch ${HONCHO_REF} \
+        https://github.com/plastic-labs/honcho.git /honcho \
+    || (git clone https://github.com/plastic-labs/honcho.git /honcho \
+        && cd /honcho && git checkout ${HONCHO_REF})
+
+# ---------------------------------------------------------------------------
+# Stage 2: build the runtime image.
+#
+# Follows Honcho's own Dockerfile conventions (python:3.13-slim-bookworm,
+# uv from ghcr.io/astral-sh/uv, UV_COMPILE_BYTECODE, non-root app user).
+# The key difference: we cannot use --mount=type=bind against the git source,
+# so we COPY the source tree first, then run uv sync normally.
+# ---------------------------------------------------------------------------
+FROM python:3.13-slim-bookworm AS runtime
+
+COPY --from=ghcr.io/astral-sh/uv:0.9.24 /uv /bin/uv
+
+WORKDIR /app
+
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_LINK_MODE=copy
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PATH="/app/.venv/bin:$PATH"
+ENV HOME=/app
+ENV UV_CACHE_DIR=/tmp/uv-cache
+
+# Copy lock and project descriptor first so dependency layers cache
+# independently of application source changes.
+COPY --from=source /honcho/uv.lock /honcho/pyproject.toml /app/
+
+# Install dependencies (no dev group).
+RUN uv sync --frozen --no-install-project --no-group dev
+
+# Copy the full source tree.
+COPY --from=source /honcho/src/        /app/src/
+COPY --from=source /honcho/migrations/ /app/migrations/
+COPY --from=source /honcho/scripts/    /app/scripts/
+COPY --from=source /honcho/docker/     /app/docker/
+COPY --from=source /honcho/alembic.ini /app/alembic.ini
+
+# Copy config template if present; tolerate absence.
+COPY --from=source /honcho/config.toml* /app/
+
+# Sync again now that the project source is present.
+RUN uv sync --frozen --no-group dev
+
+# Non-root user (matches Honcho convention: uid/gid "app").
+RUN addgroup --system app \
+    && adduser --system --group app \
+    && mkdir -p /tmp/uv-cache \
+    && chown -R app:app /app /tmp/uv-cache
+
+USER app
+
+EXPOSE 8000
+
+# docker/entrypoint.sh runs Alembic migrations then starts the API server.
+# The deriver service overrides this entrypoint in docker-compose.yml.
+ENTRYPOINT ["sh", "docker/entrypoint.sh"]

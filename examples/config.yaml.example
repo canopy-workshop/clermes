@@ -1,0 +1,77 @@
+# Clermes instance configuration template.
+# Copy to ~/.clermes/config.yaml and edit. Lines under instance.name and
+# instance.principal must match the deployer's setup. Everything else has
+# sensible defaults but is editable.
+
+instance:
+  # Short handle for this Clermes deployment. Workers and humans refer to
+  # the instance by this name.
+  name: YOUR_INSTANCE_NAME
+  # Person on the receiving end. Disputes route to them through files.
+  principal: YOUR_NAME
+  description: |
+    Short description of what this Clermes instance does and who it serves.
+
+paths:
+  home: ~/.clermes
+  registry: ~/.clermes/registry/fleet.json
+  protocol: ~/.clermes/PROTOCOL.md
+  workers: ~/.clermes/workers
+  logs: ~/.clermes/logs
+  done: ~/.clermes/done
+  disputes: ~/.clermes/disputes
+  announcing: ~/.clermes/announcing
+  halt: ~/.clermes/halt
+  locks: ~/.clermes/locks
+
+dispatch:
+  # Default tmux geometry for spawned workers.
+  tmux_width: 200
+  tmux_height: 50
+
+  # Grace window (seconds) workers must wait after writing an `announcing/`
+  # file before proceeding with an irreversible external action.
+  announce_grace_seconds: 10
+
+  # Maximum context-window utilization before the orchestrator suggests
+  # /compact to a worker. Workers report this via done/ payloads.
+  context_compact_threshold: 0.70
+
+routing:
+  # When a task arrives, the orchestrator picks a worker by matching
+  # keywords against this map. Ambiguous matches surface to the operator
+  # rather than guessing. Edit the keyword lists to match the fleet.
+  default_worker: scratch
+  rules:
+    example_worker_a: [keyword1, keyword2]
+    example_worker_b: [keyword3, keyword4]
+
+outbound:
+  # The orchestrator is the only outbound channel to humans. Workers
+  # cannot send email, SMS, or post to external services that contact
+  # other humans. They can stage drafts; the orchestrator delivers.
+  email: orchestrator_only
+  sms: orchestrator_only
+  agency_contact: orchestrator_only
+
+  # Local actions workers may perform without announcing:
+  unannounced_allowed:
+    - local file edits
+    - local commits
+    - reads, scrapes, builds, test runs
+    - dependency installs in their own workdir
+
+  # Actions that require an `announcing/` callout + grace window:
+  announce_required:
+    - git push to remote
+    - deploy
+    - external POST that writes (webhooks, third-party APIs)
+    - DNS / Cloudflare / hosting config changes
+
+observability:
+  telegram:
+    enabled: false
+    channel: null
+    events: [dispute, announce, done_error]
+
+  log_retention_days: 30

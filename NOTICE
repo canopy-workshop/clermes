@@ -1,0 +1,10 @@
+Clermes
+Copyright (C) 2026 Canopy Road Workshop, LLC
+
+Licensed under the GNU Affero General Public License v3.0 or later. See LICENSE for the full text.
+
+This work integrates with the following projects, retained under their own licenses:
+
+- Hermes (MIT, Nous Research). The host runtime this plugin extends.
+- Honcho (AGPL-3.0, Plastic Labs). The shared-memory backend.
+- Claude Code (commercial, Anthropic). The worker runtime.

@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Honcho stack for clermes. Local-LLM-first defaults.
+# Pinned to HONCHO_REF=v3.0.7 by default.
+#
+# Usage:
+#   1. Copy and edit env:
+#        cp honcho/.env.example honcho/.env
+#      Defaults wire deriver + embeddings to a local Ollama on host.
+#      Make sure Ollama is running and the named models are pulled.
+#   2. Make sure the postgres bind-mount target exists with the right owner:
+#        sudo mkdir -p /srv/pgdata/honcho && sudo chown 999:999 /srv/pgdata/honcho
+#      999:999 is the postgres uid:gid inside the pgvector image.
+#   3. Bring it up from the repo root:
+#        make honcho-up
+#      Or directly: cd honcho && docker compose up -d --build
+#   4. Verify:
+#        curl -s http://127.0.0.1:8001/health
+#
+# The API binds to 127.0.0.1:8001 by default. Postgres data lives on a
+# bind mount at /srv/pgdata/honcho/ so daily host backups capture it.
+# Named Docker volumes are NOT in the backup path; do not move postgres
+# off this bind mount without updating your backup config.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.honcho
+      args:
+        HONCHO_REF: ${HONCHO_REF:-v3.0.7}
+    entrypoint: ["sh", "docker/entrypoint.sh"]
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8001:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/app/.venv/bin/python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    environment:
+      - DB_CONNECTION_URI=postgresql+psycopg://postgres:postgres@database:5432/postgres
+      - CACHE_URL=redis://redis:6379/0?suppress=true
+      - CACHE_ENABLED=true
+    env_file:
+      - path: .env
+        required: false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  deriver:
+    build:
+      context: .
+      dockerfile: Dockerfile.honcho
+      args:
+        HONCHO_REF: ${HONCHO_REF:-v3.0.7}
+    entrypoint: ["/app/.venv/bin/python", "-m", "src.deriver"]
+    depends_on:
+      api:
+        condition: service_healthy
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DB_CONNECTION_URI=postgresql+psycopg://postgres:postgres@database:5432/postgres
+      - CACHE_URL=redis://redis:6379/0?suppress=true
+      - CACHE_ENABLED=true
+    env_file:
+      - path: .env
+        required: false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  database:
+    image: pgvector/pgvector:pg15
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5431:5432"
+    command: ["postgres", "-c", "max_connections=200"]
+    environment:
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_HOST_AUTH_METHOD=trust
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - /srv/pgdata/honcho:/var/lib/postgresql/data/
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8.2
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  redis-data:
