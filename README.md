@@ -3,6 +3,29 @@
 
 File-based orchestration for a fleet of long-lived Claude Code workers.
 
+## Project shelved (October 2026)
+
+I am pausing active development of Clermes in favor of upstream enhancements
+in [Hermes Agent](https://github.com/NousResearch/hermes-agent) and projects
+like [OpenRig](https://github.com/mvschwarz/openrig). This repository remains
+available as a reference; the documentation below describes the existing
+implementation, and the planned v1.0.0 release is shelved.
+
+I built Clermes to keep persistent coding workers coordinated across
+projects: dispatching tasks, preserving context, and surfacing completions
+and decisions without spending my day checking terminals. I am proud of
+the work that went into it.
+
+Seeing these capabilities find a home upstream, and seeing other projects
+independently develop similar approaches, is flattering. I have a lot of
+respect for the maintainers carrying this work forward and keeping pace
+with the tools underneath it.
+
+Stepping back is also a load off my shoulders. I built Clermes to give
+myself more time to run my business. Using those upstream improvements
+lets me put more of that time into client work and less into maintaining
+my own orchestration layer.
+
 ## Overview
 
 Clermes runs a fleet of Claude Code workers in tmux, each pinned to one
@@ -24,7 +47,7 @@ workers share a single user model across sessions.
 
 ```bash
 # Clone and install the Python package.
-git clone https://github.com/your-org/clermes.git
+git clone https://github.com/canopy-workshop/clermes.git
 cd clermes
 make install             # pip install -e . in a venv
 
@@ -104,7 +127,8 @@ events = clermes_drain_events(types=["done", "dispute"])
 
 ## Status
 
-Pre-release. v1.0.0 is the next cut. Private repo; not yet published.
+Shelved as of October 2026. Active development is paused, and the planned
+v1.0.0 release is shelved. The public repository is retained for reference.
 
 ## License
 
